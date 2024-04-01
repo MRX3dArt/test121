@@ -1,86 +1,95 @@
 package main
 
 import (
+	"database/sql"
+	"encoding/json"
 	"fmt"
-	"sync"
-	"time"
+	"github.com/gorilla/mux"
+	_ "github.com/lib/pq"
+	"log"
+	"net/http"
+	"strconv"
 )
 
-type Ttype struct {
-	id         int
-	cT         string
-	fT         string
-	taskRESULT []byte
+type Client struct {
+	ID      int     `json:"id"`
+	Name    string  `json:"name"`
+	Balance float64 `json:"balance"`
 }
 
-func taskCreturer(a chan Ttype, wg *sync.WaitGroup) {
-	defer wg.Done()
-	go func() {
-		for {
-			ft := time.Now().Format(time.RFC3339)
-			if time.Now().Nanosecond()%2 > 0 {
-				ft = "Some error occurred"
-			}
-			a <- Ttype{cT: ft, id: int(time.Now().Unix())}
-		}
-	}()
-}
-
-func taskWorker(a Ttype) Ttype {
-	tt, _ := time.Parse(time.RFC3339, a.cT)
-	if tt.After(time.Now().Add(-20 * time.Second)) {
-		a.taskRESULT = []byte("task has been successed")
-	} else {
-		a.taskRESULT = []byte("something went wrong")
-	}
-	a.fT = time.Now().Format(time.RFC3339Nano)
-	time.Sleep(time.Millisecond * 150)
-	return a
-}
+var db *sql.DB
 
 func main() {
-	superChan := make(chan Ttype, 10)
+	var err error
+	db, err = sql.Open("postgres", "postgresql://user:password@localhost/bank?sslmode=disable")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+	fmt.Println(db)
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go taskCreturer(superChan, &wg)
+	router := mux.NewRouter()
+	router.HandleFunc("/clients/{id}", getClient).Methods("GET")
+	router.HandleFunc("/clients/transfer", transfer).Methods("POST")
+	log.Fatal(http.ListenAndServe(":8080", router))
+}
 
-	doneTasks := make([]Ttype, 0)
-	undoneTasks := make([]error, 0)
+func getClient(w http.ResponseWriter, r *http.Request) {
+	params := mux.Vars(r)
+	id, _ := strconv.Atoi(params["id"])
+	client := Client{}
+	err := db.QueryRow("SELECT id, name, balance FROM clients WHERE id = $1", id).Scan(&client.ID, &client.Name, &client.Balance)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(client)
+}
 
-	tasksorter := func(t Ttype, wg *sync.WaitGroup) {
-		defer wg.Done()
-		if string(t.taskRESULT)[:14] == "task has been" {
-			doneTasks = append(doneTasks, t)
-		} else {
-			undoneTasks = append(undoneTasks, fmt.Errorf("Task id %d time %s, error %s", t.id, t.cT, t.taskRESULT))
-		}
+func transfer(w http.ResponseWriter, r *http.Request) {
+	var transfer struct {
+		SenderID   int     `json:"sender_id"`
+		ReceiverID int     `json:"receiver_id"`
+		Amount     float64 `json:"amount"`
+	}
+	err := json.NewDecoder(r.Body).Decode(&transfer)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	var senderBalance float64
+	err = tx.QueryRow("SELECT balance FROM clients WHERE id = $1", transfer.SenderID).Scan(&senderBalance)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if senderBalance < transfer.Amount {
+		http.Error(w, "Insufficient balance", http.StatusBadRequest)
+		return
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for t := range superChan {
-			t = taskWorker(t)
-			wg.Add(1)
-			go tasksorter(t, &wg)
-		}
-	}()
-
-	go func() {
-		wg.Wait()
-		close(superChan)
-	}()
-
-	wg.Wait()
-
-	fmt.Println("Errors:")
-	for _, err := range undoneTasks {
-		fmt.Println(err)
+	_, err = tx.Exec("UPDATE clients SET balance = balance - $1 WHERE id = $2", transfer.Amount, transfer.SenderID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_, err = tx.Exec("UPDATE clients SET balance = balance + $1 WHERE id = $2", transfer.Amount, transfer.ReceiverID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
-	fmt.Println("Done tasks:")
-	for _, t := range doneTasks {
-		fmt.Println(t.id)
+	err = tx.Commit()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
+	fmt.Fprintf(w, "Transfer successful")
 }

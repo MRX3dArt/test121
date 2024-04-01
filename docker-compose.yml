@@ -1,0 +1,27 @@
+version: '3'
+services:
+  db:
+    image: postgres
+    restart: always
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: bank
+    ports:
+      - "5432:5432"
+
+  rabbitmq:
+    image: rabbitmq
+    restart: always
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  app:
+    build: .
+    restart: always
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+      - rabbitmq
